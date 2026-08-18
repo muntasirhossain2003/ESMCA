@@ -35,9 +35,14 @@ def attribution_fidelity(prototypes: Dict[str, torch.Tensor]) -> Dict[str, objec
     task_names = list(prototypes.keys())
     if len(task_names) < 2:
         return {"embedding": None, "silhouette": 0.0, "task_names": task_names}
-    matrix = torch.stack([prototypes[t] for t in task_names]).numpy()
+    matrix = torch.stack([prototypes[t] for t in task_names]).cpu().numpy()
     perplexity = max(1, min(30, len(task_names) - 1))
     embedding = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=0).fit_transform(matrix)
     labels = np.arange(len(task_names))
-    silhouette = silhouette_score(matrix, labels) if len(task_names) > 2 else 0.0
+    # silhouette_score requires n_labels < n_samples; with one prototype per
+    # task they're equal, so it's undefined — fall back to 0.0.
+    if len(task_names) > 2 and len(task_names) < len(matrix):
+        silhouette = silhouette_score(matrix, labels)
+    else:
+        silhouette = 0.0
     return {"embedding": embedding, "silhouette": float(silhouette), "task_names": task_names}

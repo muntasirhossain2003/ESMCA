@@ -33,6 +33,11 @@ from esmca.models.esmca_model import ESMCAModel
 from esmca.training.losses import task_loss
 from esmca.utils.logging import get_logger
 
+try:  # torch >= 2.x unified AMP API
+    from torch.amp import GradScaler
+except ImportError:  # pragma: no cover - older torch
+    from torch.cuda.amp import GradScaler
+
 logger = get_logger(__name__)
 
 
@@ -47,10 +52,12 @@ class ContinualTrainer:
         drift_delta: float = 0.05,
         attrib_loss_weight: float = 1.0,
         ig_steps: int = 32,
+        weight_decay: float = 0.0,
     ):
         self.model = model.to(device)
         self.device = device
         self.lr = lr
+        self.weight_decay = weight_decay
         self.epochs_per_task = epochs_per_task
         self.n_prototype_samples = n_prototype_samples
         self.attrib_loss_weight = attrib_loss_weight
@@ -88,51 +95,84 @@ class ContinualTrainer:
     def _consolidation_step(self, optimizer: AdamW, flagged_tasks: List[str], task_name: str) -> None:
         if not flagged_tasks:
             return
-        optimizer.zero_grad()
-        total = torch.tensor(0.0, device=self.device)
+        # Accumulate gradients one task at a time to avoid OOM from
+        # storing multiple autograd graphs simultaneously.
+        grad_accum: Dict[torch.Tensor, torch.Tensor] = {}
         for past_name in flagged_tasks:
+            optimizer.zero_grad()
             batch = next(iter(self.tasks[past_name].val_loader))
             batch = self._batch_to_device(batch)
             attrs = self.ame.attribute_differentiable(
                 batch["input_ids"], batch["attention_mask"], target=batch["labels"]
             )
             current_attr = attrs.mean(dim=0)
-            total = total + self.attrib_loss_weight * self.edm.attribution_loss(
+            loss = self.attrib_loss_weight * self.edm.attribution_loss(
                 current_attr, self.prototypes[past_name]
             )
-        total.backward()
+            loss.backward()
+            for p in optimizer.param_groups[0]["params"]:
+                if p.grad is not None:
+                    if p in grad_accum:
+                        grad_accum[p] = grad_accum[p] + p.grad.clone()
+                    else:
+                        grad_accum[p] = p.grad.clone()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        # Apply accumulated gradients and step once
+        for p, g in grad_accum.items():
+            p.grad = g
         optimizer.step()
 
-    def train_task(self, task: Task) -> None:
+    def train_task(self, task: Task, compute_prototype: bool = True) -> None:
         task_name = task.name
         self.tasks[task_name] = task
+        logger.info(f"=== Starting task '{task_name}' ({len(self.prototypes)} previous tasks) ===")
         flagged_tasks = self._pre_training_drift_check(task_name)
+        if flagged_tasks:
+            logger.info(f"  Consolidation will regularize: {flagged_tasks}")
 
         self.model.start_new_task(task_name)
         params = list(self.model.task_trainable_parameters(task_name))
-        optimizer = AdamW(params, lr=self.lr)
+        n_trainable = sum(p.numel() for p in params)
+        logger.info(f"  Trainable parameters: {n_trainable:,}")
+        optimizer = AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        # The frozen backbone runs fp16 (6 GB GPU), so gradients flow through
+        # 24 layers of fp16 activations and underflow without loss scaling.
+        scaler = GradScaler("cuda", enabled=self.device.type == "cuda")
 
         for epoch in range(self.epochs_per_task):
             self.model.train()
+            epoch_loss = 0.0
+            n_batches = 0
             for batch in tqdm(task.train_loader, desc=f"[{task_name}] epoch {epoch + 1}/{self.epochs_per_task}"):
                 batch = self._batch_to_device(batch)
                 optimizer.zero_grad()
                 logits = self.model.forward_task(batch["input_ids"], batch["attention_mask"], task_name)
                 loss = task_loss(logits, batch["labels"])
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_loss += loss.item()
+                n_batches += 1
+            avg_loss = epoch_loss / max(n_batches, 1)
+            logger.info(f"  epoch {epoch + 1}/{self.epochs_per_task} — avg_loss={avg_loss:.4f}")
             self._consolidation_step(optimizer, flagged_tasks, task_name)
 
         self.model.eval()
-        prototype = self.ame.compute_prototype(task.val_loader, n_samples=self.n_prototype_samples)
-        self.prototypes[task_name] = prototype.detach()
+        if compute_prototype:
+            logger.info(f"  Computing prototype ({self.n_prototype_samples} samples)...")
+            prototype = self.ame.compute_prototype(task.val_loader, n_samples=self.n_prototype_samples)
+            self.prototypes[task_name] = prototype.detach()
         self.model.freeze_task(task_name)
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         logger.info(f"Finished task '{task_name}'. Bank now holds {len(self.prototypes)} task(s).")
 
     def predict_routed(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Task-label-free inference: attribute against the frozen backbone,
         route via cosine similarity to stored prototypes, then compose."""
         self.model.eval()
-        phi_x = self.ame.attribute(input_ids, attention_mask)
-        weights = self.router.route(phi_x, self.prototypes)
+        with torch.no_grad():
+            phi_x = self.ame.attribute(input_ids, attention_mask)
+            weights = self.router.route(phi_x, self.prototypes)
         return self.model.forward_composed(input_ids, attention_mask, weights)

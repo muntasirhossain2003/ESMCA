@@ -21,25 +21,33 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from esmca.models.backbone import ClassificationHead, find_query_value_linears, load_backbone
+from esmca.models.backbone import ClassificationHead, NUM_CHOICES, find_lora_targets, load_backbone
 from esmca.models.lora import AdapterBank, inject_lora
 
 
 class ESMCAModel(nn.Module):
-    def __init__(self, model_name: str, lora_rank: int, lora_alpha: int):
+    def __init__(self, model_name: str, lora_rank: int, lora_alpha: int, lora_targets=("q", "v"), lora_dropout: float = 0.0):
         super().__init__()
         self.backbone, self.tokenizer = load_backbone(model_name)
-        targets = find_query_value_linears(self.backbone)
-        self.adapter_bank: AdapterBank = inject_lora(self.backbone, targets, rank=lora_rank, alpha=lora_alpha)
+        targets = find_lora_targets(self.backbone, target_types=tuple(lora_targets))
+        self.adapter_bank: AdapterBank = inject_lora(targets, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
         self.head = ClassificationHead(self.backbone.config.hidden_size)
 
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        return outputs.last_hidden_state[:, 0]  # [CLS]
+        # input_ids is [B, num_choices, L] (choice-scoring); flatten choices so
+        # the whole batch runs through the encoder in one pass.
+        batch_size = input_ids.shape[0]
+        flat_ids = input_ids.reshape(batch_size * NUM_CHOICES, -1)
+        flat_mask = attention_mask.reshape(batch_size * NUM_CHOICES, -1)
+        outputs = self.backbone(input_ids=flat_ids, attention_mask=flat_mask)
+        cls_hidden = outputs.last_hidden_state[:, 0]  # [B * num_choices, H] [CLS]
+        # Backbone runs fp16; up-cast to the head's fp32 so addmm isn't mixed-dtype.
+        return cls_hidden.to(self.head.dense.weight.dtype)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         cls_hidden = self.encode(input_ids, attention_mask)
-        return self.head(cls_hidden)
+        scores = self.head(cls_hidden)  # [B * num_choices, 1]
+        return scores.view(input_ids.shape[0], NUM_CHOICES)
 
     def forward_frozen(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Pass with no adapters active -- used as the AME's attribution target."""

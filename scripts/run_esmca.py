@@ -37,8 +37,20 @@ def main() -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    model = ESMCAModel(cfg.backbone, lora_rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha)
-    tasks = load_mmlu_tasks(cfg.subjects, model.tokenizer, cfg.max_seq_len, cfg.batch_size)
+    logger.info(f"Config: backbone={cfg.backbone}, lora_rank={cfg.lora_rank}, lora_alpha={cfg.lora_alpha}")
+    logger.info(f"Device: {device}, subjects: {cfg.subjects}")
+    logger.info(f"Training: epochs={cfg.epochs_per_task}, lr={cfg.lr}, batch_size={cfg.batch_size}")
+
+    model = ESMCAModel(
+        cfg.backbone,
+        lora_rank=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_targets=cfg.lora_targets,
+        lora_dropout=cfg.lora_dropout,
+    )
+    tasks = load_mmlu_tasks(
+        cfg.subjects, model.tokenizer, cfg.max_seq_len, cfg.batch_size, train_frac=cfg.train_frac, seed=cfg.seed
+    )
 
     trainer = ContinualTrainer(
         model,
@@ -49,6 +61,7 @@ def main() -> None:
         drift_delta=cfg.drift_delta,
         attrib_loss_weight=cfg.attrib_loss_weight,
         ig_steps=cfg.ig_steps,
+        weight_decay=cfg.weight_decay,
     )
 
     R = []
@@ -67,8 +80,9 @@ def main() -> None:
             acc = evaluate_accuracy(predict_fn, tasks[j].test_loader)
             row.append(acc)
         R.append(row)
-        logger.info(f"[esmca] finished '{task.name}', row={row}")
+        logger.info(f"[eval] after '{task.name}': accuracies={[f'{a:.3f}' for a in row]}")
 
+    logger.info("=== Training complete. Computing final metrics ===")
     acc = compute_acc(R)
     bwt = compute_bwt(R)
     fwt = compute_fwt(R)
@@ -76,13 +90,14 @@ def main() -> None:
 
     true_idx, routed_idx = [], []
     task_order = trainer.model.adapter_bank.task_order
-    for j, task in enumerate(tasks):
-        for batch in task.test_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            phi_x = trainer.ame.attribute(batch["input_ids"], batch["attention_mask"])
-            weights = trainer.router.route(phi_x, trainer.prototypes)
-            routed_idx.append(task_order.index(max(weights, key=weights.get)))
-            true_idx.append(j)
+    with torch.no_grad():
+        for j, task in enumerate(tasks):
+            for batch in task.test_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                phi_x = trainer.ame.attribute(batch["input_ids"], batch["attention_mask"])
+                weights = trainer.router.route(phi_x, trainer.prototypes)
+                routed_idx.append(task_order.index(max(weights, key=weights.get)))
+                true_idx.append(j)
     ris = routing_interpretability_score(true_idx, routed_idx)
     fidelity = attribution_fidelity(trainer.prototypes)
 
@@ -100,7 +115,14 @@ def main() -> None:
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    logger.info(f"ACC={acc:.4f} BWT={bwt:.4f} FWT={fwt:.4f} ADS={ads:.4f} RIS={ris:.4f}")
+    logger.info(f"=== Final Results ===")
+    logger.info(f"  ACC  (Average Accuracy)       = {acc:.4f}")
+    logger.info(f"  BWT  (Backward Transfer)      = {bwt:.4f}")
+    logger.info(f"  FWT  (Forward Transfer)       = {fwt:.4f}")
+    logger.info(f"  ADS  (Attribution Drift Score) = {ads:.4f}")
+    logger.info(f"  RIS  (Routing Interpretability) = {ris:.4f}")
+    logger.info(f"  Silhouette (Fidelity)         = {fidelity['silhouette']:.4f}")
+    logger.info(f"  Task order: {task_order}")
     logger.info(f"Results written to {out_path}")
 
 

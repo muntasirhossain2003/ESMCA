@@ -20,14 +20,16 @@ import torch.nn as nn
 class LoRAPair(nn.Module):
     """A single task's (A, B) low-rank pair for one linear layer."""
 
-    def __init__(self, in_features: int, out_features: int, rank: int):
+    def __init__(self, in_features: int, out_features: int, rank: int, dropout: float = 0.0):
         super().__init__()
         self.A = nn.Parameter(torch.zeros(rank, in_features))
         self.B = nn.Parameter(torch.zeros(out_features, rank))
         nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
         nn.init.zeros_(self.B)  # zero-init B so the adapter starts as a no-op
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(x).to(self.A.dtype)
         return (x @ self.A.t()) @ self.B.t()
 
 
@@ -41,7 +43,7 @@ class LoRAInjectedLinear(nn.Module):
         blends every stored task adapter's contribution (Eq. 3).
     """
 
-    def __init__(self, base_linear: nn.Linear, rank: int, alpha: int):
+    def __init__(self, base_linear: nn.Linear, rank: int, alpha: int, dropout: float = 0.0):
         super().__init__()
         self.base = base_linear
         for p in self.base.parameters():
@@ -50,12 +52,17 @@ class LoRAInjectedLinear(nn.Module):
         self.scaling = alpha / rank
         self.in_features = base_linear.in_features
         self.out_features = base_linear.out_features
+        self.dropout = dropout
         self.adapters = nn.ModuleDict()
         self.active_task: Optional[str] = None
         self.routing_weights: Optional[Dict[str, float]] = None
 
     def add_task(self, task_name: str) -> None:
-        self.adapters[task_name] = LoRAPair(self.in_features, self.out_features, self.rank)
+        pair = LoRAPair(self.in_features, self.out_features, self.rank, dropout=self.dropout)
+        # Ensure adapter is on the same device as the base weights
+        device = next(self.base.parameters()).device
+        pair = pair.to(device)
+        self.adapters[task_name] = pair
 
     def freeze_task(self, task_name: str) -> None:
         for p in self.adapters[task_name].parameters():
@@ -71,13 +78,17 @@ class LoRAInjectedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
+        # LoRA deltas are float32 (trainable); the frozen backbone may be fp16,
+        # so cast the delta back to the base output's dtype before adding.
         if self.active_task is not None:
-            out = out + self.scaling * self.adapters[self.active_task](x)
+            delta = self.scaling * self.adapters[self.active_task](x)
+            out = out + delta.to(out.dtype)
         elif self.routing_weights:
             for task_name, weight in self.routing_weights.items():
                 if weight == 0.0 or task_name not in self.adapters:
                     continue
-                out = out + weight * self.scaling * self.adapters[task_name](x)
+                delta = weight * self.scaling * self.adapters[task_name](x)
+                out = out + delta.to(out.dtype)
         return out
 
 
@@ -110,14 +121,17 @@ class AdapterBank:
             yield from module.adapters[task_name].parameters()
 
 
-def inject_lora(backbone: nn.Module, targets: List[Tuple[str, nn.Linear]], rank: int, alpha: int) -> AdapterBank:
-    """Replace each targeted WQ/WV `nn.Linear` in-place with a `LoRAInjectedLinear`."""
+def inject_lora(targets: List[Tuple[str, nn.Module, str]], rank: int, alpha: int, dropout: float = 0.0) -> AdapterBank:
+    """Replace each targeted `nn.Linear` in-place with a `LoRAInjectedLinear`.
+
+    `targets` are `(name, parent_module, attr_name)` triples from
+    `esmca.models.backbone.find_lora_targets` (q/k/v/out across both
+    RoBERTa and DeBERTa backbones).
+    """
     injected: List[Tuple[str, LoRAInjectedLinear]] = []
-    for layer_idx, layer in enumerate(backbone.encoder.layer):
-        attn = layer.attention.self
-        for attr_name in ("query", "value"):
-            base_linear = getattr(attn, attr_name)
-            wrapped = LoRAInjectedLinear(base_linear, rank=rank, alpha=alpha)
-            setattr(attn, attr_name, wrapped)
-            injected.append((f"layer{layer_idx}.{attr_name}", wrapped))
+    for name, parent, attr in targets:
+        base_linear = getattr(parent, attr)
+        wrapped = LoRAInjectedLinear(base_linear, rank=rank, alpha=alpha, dropout=dropout)
+        setattr(parent, attr, wrapped)
+        injected.append((name, wrapped))
     return AdapterBank(injected)
